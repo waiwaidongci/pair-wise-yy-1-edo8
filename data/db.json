@@ -32,5 +32,68 @@
       "qualified": false,
       "note": "仍偏快，振幅尚可"
     }
-  ]
+  ],
+  "technicians": [
+    {
+      "id": "tech_chen",
+      "name": "陈砚秋",
+      "role": "高级技师",
+      "active": true,
+      "createdAt": "2026-06-16T00:00:00.000Z"
+    },
+    {
+      "id": "tech_lin",
+      "name": "林晚舟",
+      "role": "复核技师",
+      "active": true,
+      "createdAt": "2026-06-16T00:00:00.000Z"
+    },
+    {
+      "id": "tech_wang",
+      "name": "王持正",
+      "role": "见习技师",
+      "active": true,
+      "createdAt": "2026-06-16T00:00:00.000Z"
+    }
+  ],
+  "lockReviews": [
+    {
+      "id": "lock_review_demo",
+      "clockId": "clock_demo",
+      "adjustmentId": "adjustment_demo",
+      "technicianIds": [
+        "tech_chen",
+        "tech_lin"
+      ],
+      "technicians": [
+        {
+          "id": "tech_chen",
+          "name": "陈砚秋",
+          "role": "高级技师"
+        },
+        {
+          "id": "tech_lin",
+          "name": "林晚舟",
+          "role": "复核技师"
+        }
+      ],
+      "reviewedAt": "2026-06-16T00:00:00.000Z",
+      "measurements": {
+        "capJewelClearanceMm": 0.02,
+        "lockValueMm": 0.035,
+        "drawAngleDegrees": 12
+      },
+      "status": "qualified",
+      "qualified": true,
+      "pendingMaintenance": false,
+      "missingFields": [],
+      "issues": [],
+      "note": "进瓦/出瓦锁值居中，牵引正常，托钻间隙合格",
+      "valid": true,
+      "supersededAt": null,
+      "supersededReason": null,
+      "createdAt": "2026-06-16T00:00:00.000Z"
+    }
+  ],
+  "escapementReplacements": []
 }
