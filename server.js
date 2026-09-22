@@ -2,6 +2,18 @@ const http = require("http");
 const { readFile, writeFile, mkdir } = require("fs/promises");
 const path = require("path");
 
+// 擒纵叉瓦锁值复核台：入口、判定、存档三个业务部分
+const { buildReviewDraft } = require("./src/reviewEntry");
+const { judgeReview } = require("./src/reviewJudgment");
+const {
+  findReusableReview,
+  saveReview,
+  invalidateReviews,
+  reviewsOf,
+  latestValidReview,
+  pendingMaintenance
+} = require("./src/reviewArchive");
+
 const PORT = Number(process.env.PORT || 3021);
 const DB_FILE = path.join(__dirname, "data", "db.json");
 
@@ -39,7 +51,9 @@ const initialData = {
       qualified: false,
       note: "仍偏快，振幅尚可"
     }
-  ]
+  ],
+  reviews: [],
+  partReplacements: []
 };
 
 const routes = [
@@ -47,12 +61,18 @@ const routes = [
   "GET /clocks",
   "POST /clocks",
   "GET /clocks/not-qualified",
+  "GET /clocks/pending-maintenance",
   "GET /clocks/:id/history",
   "POST /clocks/:id/adjustments",
   "POST /clocks/:id/retests",
   "GET /clocks/:id/latest-retest",
+  "POST /clocks/:id/reviews",
+  "GET /clocks/:id/reviews",
+  "GET /clocks/:id/latest-review",
+  "POST /clocks/:id/escapement-parts",
   "GET /adjustments",
-  "GET /retests"
+  "GET /retests",
+  "GET /reviews"
 ];
 
 async function ensureDb() {
@@ -66,11 +86,26 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const db = JSON.parse(await readFile(DB_FILE, "utf8"));
+  db.clocks = db.clocks || [];
+  db.adjustments = db.adjustments || [];
+  db.retests = db.retests || [];
+  db.reviews = db.reviews || [];
+  db.partReplacements = db.partReplacements || [];
+  return db;
 }
 
 async function writeDb(data) {
   await writeFile(DB_FILE, JSON.stringify(data, null, 2));
+}
+
+// 按钟表串行化写操作：并发重复提交在锁内重读存档后即可沿用首次结果。
+const clockLocks = new Map();
+function withClockLock(clockId, task) {
+  const prev = clockLocks.get(clockId) || Promise.resolve();
+  const run = prev.then(() => task());
+  clockLocks.set(clockId, run.catch(() => {}));
+  return run;
 }
 
 function send(res, status, body) {
@@ -133,6 +168,8 @@ function clockSummary(db, clock) {
     ...clock,
     latestAdjustment: adjustment,
     latestRetest: retest,
+    latestReview: latestValidReview(db, clock.id),
+    pendingMaintenance: pendingMaintenance(db, clock.id),
     qualified: retest ? retest.qualified : false
   };
 }
@@ -178,31 +215,53 @@ async function handle(req, res) {
     return send(res, 200, { data });
   }
 
+  if (req.method === "GET" && pathname === "/clocks/pending-maintenance") {
+    const data = db.clocks.map((clock) => clockSummary(db, clock)).filter((clock) => clock.pendingMaintenance);
+    return send(res, 200, { data });
+  }
+
   const historyMatch = pathname.match(/^\/clocks\/([^/]+)\/history$/);
   if (historyMatch && req.method === "GET") {
     const clock = findClock(db, historyMatch[1]);
     const adjustments = db.adjustments.filter((item) => item.clockId === clock.id);
     const retests = db.retests.filter((item) => item.clockId === clock.id);
-    return send(res, 200, { data: { clock, adjustments, retests, latestRetest: latestRetest(db, clock.id) } });
+    const partReplacements = db.partReplacements.filter((item) => item.clockId === clock.id);
+    return send(res, 200, {
+      data: {
+        clock,
+        adjustments,
+        retests,
+        reviews: reviewsOf(db, clock.id),
+        partReplacements,
+        latestRetest: latestRetest(db, clock.id),
+        latestReview: latestValidReview(db, clock.id)
+      }
+    });
   }
 
+  // 更正调校：新调校落库后，该钟表旧复核全部失效，后续复核按现有调校重算。
   const adjustmentMatch = pathname.match(/^\/clocks\/([^/]+)\/adjustments$/);
   if (adjustmentMatch && req.method === "POST") {
-    const clock = findClock(db, adjustmentMatch[1]);
+    const clockId = adjustmentMatch[1];
     const body = await parseBody(req);
     required(body, ["currentDailyRateSeconds", "direction", "amount"]);
-    const adjustment = {
-      id: makeId("adjustment"),
-      clockId: clock.id,
-      currentDailyRateSeconds: Number(body.currentDailyRateSeconds),
-      direction: body.direction,
-      amount: body.amount,
-      note: body.note || "",
-      createdAt: new Date().toISOString()
-    };
-    db.adjustments.push(adjustment);
-    await writeDb(db);
-    return send(res, 201, { data: adjustment });
+    return withClockLock(clockId, async () => {
+      const fresh = await readDb();
+      const clock = findClock(fresh, clockId);
+      const adjustment = {
+        id: makeId("adjustment"),
+        clockId: clock.id,
+        currentDailyRateSeconds: Number(body.currentDailyRateSeconds),
+        direction: body.direction,
+        amount: body.amount,
+        note: body.note || "",
+        createdAt: new Date().toISOString()
+      };
+      fresh.adjustments.push(adjustment);
+      const invalidatedReviews = invalidateReviews(fresh, clock.id, `更正调校：${adjustment.id}`);
+      await writeDb(fresh);
+      return send(res, 201, { data: adjustment, invalidatedReviews });
+    });
   }
 
   const retestMatch = pathname.match(/^\/clocks\/([^/]+)\/retests$/);
@@ -235,6 +294,78 @@ async function handle(req, res) {
     return send(res, 200, { data: latestRetest(db, latestMatch[1]) });
   }
 
+  // 复核入口：绑定钟表、当前调校与两名技师，登记三项量测；
+  // 相同人员或并发重复提交沿用首次结果，否则经判定部分得出结论后落存档。
+  const reviewMatch = pathname.match(/^\/clocks\/([^/]+)\/reviews$/);
+  if (reviewMatch && req.method === "POST") {
+    const clockId = reviewMatch[1];
+    const body = await parseBody(req);
+    return withClockLock(clockId, async () => {
+      const fresh = await readDb();
+      const clock = findClock(fresh, clockId);
+      const draft = buildReviewDraft({
+        clock,
+        currentAdjustment: latestAdjustment(fresh, clockId),
+        body,
+        id: makeId("review")
+      });
+      const reusable = findReusableReview(fresh, draft);
+      if (reusable) {
+        return send(res, 200, {
+          data: reusable,
+          reused: true,
+          message: "相同人员的复核沿用首次结果",
+          clock: clockSummary(fresh, clock)
+        });
+      }
+      const { result, reasons } = judgeReview(draft);
+      const review = saveReview(fresh, {
+        ...draft,
+        result,
+        reasons,
+        valid: true,
+        invalidatedAt: null,
+        invalidateReason: null
+      });
+      await writeDb(fresh);
+      return send(res, 201, { data: review, reused: false, clock: clockSummary(fresh, clock) });
+    });
+  }
+
+  if (reviewMatch && req.method === "GET") {
+    const clock = findClock(db, reviewMatch[1]);
+    return send(res, 200, { data: reviewsOf(db, clock.id) });
+  }
+
+  const latestReviewMatch = pathname.match(/^\/clocks\/([^/]+)\/latest-review$/);
+  if (latestReviewMatch && req.method === "GET") {
+    const clock = findClock(db, latestReviewMatch[1]);
+    return send(res, 200, { data: latestValidReview(db, clock.id) });
+  }
+
+  // 更换擒纵部件：登记部件更换，该钟表旧复核全部失效。
+  const partsMatch = pathname.match(/^\/clocks\/([^/]+)\/escapement-parts$/);
+  if (partsMatch && req.method === "POST") {
+    const clockId = partsMatch[1];
+    const body = await parseBody(req);
+    required(body, ["part"]);
+    return withClockLock(clockId, async () => {
+      const fresh = await readDb();
+      const clock = findClock(fresh, clockId);
+      const replacement = {
+        id: makeId("part"),
+        clockId: clock.id,
+        part: body.part,
+        note: body.note || "",
+        createdAt: new Date().toISOString()
+      };
+      fresh.partReplacements.push(replacement);
+      const invalidatedReviews = invalidateReviews(fresh, clock.id, `更换擒纵部件：${body.part}`);
+      await writeDb(fresh);
+      return send(res, 201, { data: replacement, invalidatedReviews, clock: clockSummary(fresh, clock) });
+    });
+  }
+
   if (req.method === "GET" && pathname === "/adjustments") {
     const clockId = url.searchParams.get("clockId");
     return send(res, 200, { data: db.adjustments.filter((item) => !clockId || item.clockId === clockId) });
@@ -247,6 +378,20 @@ async function handle(req, res) {
       const matchClock = !clockId || item.clockId === clockId;
       const matchQualified = qualified === null || item.qualified === (qualified === "true");
       return matchClock && matchQualified;
+    });
+    return send(res, 200, { data });
+  }
+
+  // 复核存档查询：含已失效记录，历史始终可查。
+  if (req.method === "GET" && pathname === "/reviews") {
+    const clockId = url.searchParams.get("clockId");
+    const result = url.searchParams.get("result");
+    const valid = url.searchParams.get("valid");
+    const data = db.reviews.filter((item) => {
+      const matchClock = !clockId || item.clockId === clockId;
+      const matchResult = !result || item.result === result;
+      const matchValid = valid === null || (item.valid !== false) === (valid === "true");
+      return matchClock && matchResult && matchValid;
     });
     return send(res, 200, { data });
   }
